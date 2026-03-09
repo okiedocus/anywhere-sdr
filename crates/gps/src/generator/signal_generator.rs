@@ -542,6 +542,180 @@ impl SignalGenerator {
         Ok(())
     }
 
+    /// Fills an externally provided buffer with I/Q samples for the current
+    /// simulation step.
+    ///
+    /// This is the low-level generation kernel shared by both the file-based
+    /// path ([`SignalGenerator::run_simulation`]) and the callback-based
+    /// streaming path ([`SignalGenerator::run_simulation_with_callback`]).
+    ///
+    /// Unlike [`generate_and_write_samples`], this method writes into a
+    /// caller-supplied `buffer` rather than the internal [`IQWriter`] buffer,
+    /// which avoids the borrow conflict that would arise from mutably borrowing
+    /// `self.writer` and `self.channels` simultaneously.
+    ///
+    /// Each pair of consecutive elements is one I/Q sample:
+    /// `buffer[2n]` = I component, `buffer[2n+1]` = Q component, scaled to
+    /// the internal 16-bit representation (right-shifted by 7 bits from the
+    /// raw accumulator).
+    ///
+    /// `buffer` must be pre-allocated to exactly `2 * self.iq_buffer_size`
+    /// elements.
+    fn generate_samples_into(&mut self, buffer: &mut [i16]) {
+        let sampling_period = self.sample_frequency.recip();
+        let buffer_size = self.iq_buffer_size;
+        for isamp in 0..buffer_size {
+            let mut i_acc: i32 = 0;
+            let mut q_acc: i32 = 0;
+            for i in 0..MAX_CHAN {
+                if self.channels[i].prn != 0 {
+                    let (ip, qp) = self.channels[i]
+                        .generate_iq_contribution(self.antenna_gains[i]);
+                    i_acc += ip;
+                    q_acc += qp;
+                    self.channels[i].update_navigation_bits(sampling_period);
+                }
+            }
+            buffer[isamp * 2] = ((i_acc + 64) >> 7) as i16;
+            buffer[isamp * 2 + 1] = ((q_acc + 64) >> 7) as i16;
+        }
+    }
+
+    /// Runs the simulation and delivers each block of 8-bit signed I/Q samples
+    /// to a caller-provided callback.
+    ///
+    /// This is the streaming alternative to [`run_simulation`]. Instead of
+    /// writing samples to a file, every 100 ms block is converted to 8-bit
+    /// signed format — the native format expected by `HackRF` — and passed to
+    /// `on_samples`. No output file is required; `.output_file()` can be
+    /// omitted from the builder entirely.
+    ///
+    /// The callback receives a `&[u8]` slice of interleaved signed I/Q bytes:
+    /// `[I₀, Q₀, I₁, Q₁, …]` with length `2 × iq_buffer_size`
+    /// (= `2 × floor(sample_frequency × sample_rate)`).
+    ///
+    /// The callback is called synchronously from the generator's thread. For
+    /// real-time `HackRF` transmission, run the callback in a producer/consumer
+    /// pattern: the callback sends each block into a bounded
+    /// [`std::sync::mpsc::sync_channel`], and a dedicated `HackRF` thread
+    /// drains the channel and performs USB bulk transfers. The bounded channel
+    /// provides natural back-pressure without dropping samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::NotInitialized`] if called before
+    /// [`SignalGenerator::initialize`]. Propagates any error returned by
+    /// `on_samples`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use std::{sync::mpsc, time::Duration};
+    /// use gps::SignalGeneratorBuilder;
+    /// use std::path::PathBuf;
+    ///
+    /// let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(8);
+    ///
+    /// // HackRF consumer thread — replace the body with real HackRF calls.
+    /// std::thread::spawn(move || {
+    ///     while let Ok(block) = rx.recv() {
+    ///         // sdr.tx_queue().send_bulk(block, Duration::from_secs(5)).wait()
+    ///         let _ = block;
+    ///     }
+    /// });
+    ///
+    /// let mut gen = SignalGeneratorBuilder::default()
+    ///     .navigation_file(Some(PathBuf::from("brdc0010.22n"))).unwrap()
+    ///     .location(Some(vec![35.6813, 139.7662, 10.0])).unwrap()
+    ///     .duration(Some(60.0))
+    ///     .data_format(Some(8)).unwrap()
+    ///     .build().unwrap();
+    ///
+    /// gen.initialize().unwrap();
+    /// gen.run_simulation_with_callback(|block| {
+    ///     tx.send(block.to_vec())
+    ///         .map_err(|_| gps::Error::msg("HackRF channel closed"))
+    /// }).unwrap();
+    /// ```
+    pub fn run_simulation_with_callback<F>(
+        &mut self,
+        mut on_samples: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&[u8]) -> Result<(), Error>,
+    {
+        if !self.initialized {
+            return Err(Error::NotInitialized);
+        }
+        let num_steps = match self.mode {
+            MotionMode::Static => self.simulation_step_count.max(1),
+            MotionMode::Dynamic => self.simulation_step_count,
+        };
+        if num_steps == 0 {
+            eprintln!("Warning: No simulation steps requested.");
+            return Ok(());
+        }
+
+        // Allocate work buffers once; reused across every step.
+        // iq_buffer: internal 16-bit I/Q accumulator output.
+        // out_buffer: 8-bit signed bytes delivered to the callback.
+        let mut iq_buffer = vec![0i16; 2 * self.iq_buffer_size];
+        let mut out_buffer = vec![0u8; 2 * self.iq_buffer_size];
+
+        eprintln!(
+            "Starting streaming signal generation for {num_steps} steps..."
+        );
+        self.receiver_gps_time =
+            self.receiver_gps_time.add_secs(self.sample_rate);
+        let time_start = std::time::Instant::now();
+
+        for step_index in 1..num_steps {
+            let current_location = match self.mode {
+                MotionMode::Static => self.positions[0],
+                MotionMode::Dynamic => self
+                    .positions
+                    .get(step_index)
+                    .copied()
+                    .unwrap_or(self.positions[0]),
+            };
+
+            // Step 1: Update pseudorange, phase, and gain for each channel.
+            self.update_channel_parameters(current_location);
+
+            // Step 2: Generate I/Q samples into the 16-bit work buffer.
+            self.generate_samples_into(&mut iq_buffer);
+
+            // Step 3: Convert to 8-bit signed (HackRF native format).
+            // Mirrors DataFormat::Bits8 in IQWriter::write_samples:
+            //   i8_val = (i16_val >> 4) as i8
+            // The `as u8` reinterprets the two's-complement bits unchanged.
+            for (out, val) in out_buffer.iter_mut().zip(iq_buffer.iter()) {
+                *out = (i32::from(*val) >> 4) as i8 as u8;
+            }
+
+            // Step 4: Deliver the block to the caller.
+            on_samples(&out_buffer)?;
+
+            // Step 5: Periodic navigation message refresh (every 30 s).
+            self.handle_periodic_tasks(current_location);
+
+            // Step 6: Advance simulation clock.
+            self.receiver_gps_time =
+                self.receiver_gps_time.add_secs(self.sample_rate);
+            eprint!(
+                "\rTime into run = {:4.1}\0",
+                (step_index + 1) as f64 / 10.0,
+            );
+        }
+
+        eprintln!("\nDone!");
+        eprintln!(
+            "Process time = {:.1} [sec]",
+            time_start.elapsed().as_secs_f32(),
+        );
+        Ok(())
+    }
+
     /// Prints detailed status information about active satellite channels.
     ///
     /// This method displays a table of information for each active channel,

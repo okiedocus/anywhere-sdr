@@ -1,0 +1,22 @@
+[package]
+name = "gps_simulator"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "gps_simulator"
+path = "src/main.rs"
+
+[dependencies]
+# GUI
+eframe = "0.33"
+egui   = "0.33"
+# File picker (spawned in a background thread to avoid blocking the UI)
+rfd = "0.15"
+
+# GPS signal generation (local workspace crates)
+gps       = { path = "../../crates/gps" }
+libhackrf = { path = "../../crates/libhackrf" }
+
+# USB transfer blocking helper – same version as libhackrf uses
+nusb = { version = "0.2" }
