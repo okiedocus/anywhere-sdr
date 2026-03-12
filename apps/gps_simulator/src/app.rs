@@ -26,7 +26,8 @@ fn open_file_dialog(
     let (tx, rx) = mpsc::channel();
     let title = title.into();
     // Collect the filter data before moving into the thread.
-    let filters: Vec<(&'static str, &'static [&'static str])> = filters.to_vec();
+    let filters: Vec<(&'static str, &'static [&'static str])> =
+        filters.to_vec();
 
     thread::spawn(move || {
         let mut dialog = rfd::FileDialog::new().set_title(&title);
@@ -139,7 +140,13 @@ impl App {
                 |app| {
                     app.rinex_dialog = Some(open_file_dialog(
                         "Select RINEX Navigation File",
-                        &[("RINEX Navigation", &["nav", "n", "22n", "23n", "24n", "25n"])],
+                        &[(
+                            "RINEX Navigation",
+                            &[
+                                "nav", "n", "22n", "23n", "24n", "25n", "26n",
+                                "27n",
+                            ],
+                        )],
                     ));
                 },
             );
@@ -193,7 +200,8 @@ impl App {
         ui.add_space(8.0);
 
         // ── Control buttons ───────────────────────────────────────────────
-        let ready = self.rinex_path.is_some() && self.motion_path.is_some() && !running;
+        let ready =
+            self.rinex_path.is_some() && self.motion_path.is_some() && !running;
 
         ui.horizontal(|ui| {
             ui.add_enabled_ui(ready, |ui| {
@@ -206,9 +214,7 @@ impl App {
             });
 
             if running
-                && ui
-                    .button(RichText::new("  ■  Stop  ").size(15.0))
-                    .clicked()
+                && ui.button(RichText::new("  ■  Stop  ").size(15.0)).clicked()
             {
                 self.stop_flag.store(true, Ordering::Relaxed);
             }
@@ -263,12 +269,8 @@ impl App {
     /// Draws a single file-selection row with a label, truncated path display,
     /// and a Browse button.
     fn draw_file_row(
-        &mut self,
-        ui: &mut egui::Ui,
-        label: &str,
-        current: &Option<PathBuf>,
-        dialog_open: bool,
-        on_browse: impl FnOnce(&mut App),
+        &mut self, ui: &mut egui::Ui, label: &str, current: &Option<PathBuf>,
+        dialog_open: bool, on_browse: impl FnOnce(&mut App),
     ) {
         ui.horizontal(|ui| {
             ui.label(format!("{label}:"));
@@ -282,7 +284,10 @@ impl App {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let btn_text = if dialog_open { "…" } else { "Browse…" };
-                if ui.add_enabled(!dialog_open, egui::Button::new(btn_text)).clicked() {
+                if ui
+                    .add_enabled(!dialog_open, egui::Button::new(btn_text))
+                    .clicked()
+                {
                     on_browse(self);
                 }
                 ui.label(RichText::new(display).monospace().weak());
@@ -299,8 +304,10 @@ impl App {
         };
         self.stop_flag.store(false, Ordering::Relaxed);
 
-        let rinex_path = self.rinex_path.clone().expect("checked before calling");
-        let motion_path = self.motion_path.clone().expect("checked before calling");
+        let rinex_path =
+            self.rinex_path.clone().expect("checked before calling");
+        let motion_path =
+            self.motion_path.clone().expect("checked before calling");
         let settings = SimSettings {
             frequency: self.frequency,
             txvga_gain: self.txvga_gain,
@@ -310,7 +317,13 @@ impl App {
         let stop = Arc::clone(&self.stop_flag);
 
         self.sim_thread = Some(thread::spawn(move || {
-            crate::simulation::run(rinex_path, motion_path, settings, state, stop);
+            crate::simulation::run(
+                rinex_path,
+                motion_path,
+                settings,
+                state,
+                stop,
+            );
         }));
     }
 }
